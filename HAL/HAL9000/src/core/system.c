@@ -20,6 +20,7 @@
 #include "network_stack.h"
 #include "dmp_common.h"
 #include "ex_system.h"
+#include "ex_timer.h"
 #include "process_internal.h"
 #include "boot_module.h"
 #include "display.h"
@@ -66,6 +67,7 @@ SystemPreinit(
     DumpPreinit();
     ExEventSystemPreinit();
     MutexSystemPreinit();
+    ExTimerSystemPreinit();
     ThreadSystemPreinit();
     printSystemPreinit(&displayInformation);
     LogSystemPreinit();

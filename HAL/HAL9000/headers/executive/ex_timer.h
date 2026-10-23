@@ -1,5 +1,7 @@
 #pragma once
 
+#include "list.h"
+
 typedef enum _EX_TIMER_TYPE
 {
     ExTimerTypeAbsolute,
@@ -10,17 +12,34 @@ typedef enum _EX_TIMER_TYPE
 
 typedef struct _EX_TIMER
 {
+    LIST_ENTRY          WaitingList;
+    LIST_ENTRY          AllList;
+
     // absolute time
     QWORD               TriggerTimeUs;
 
     // valid only if timer is periodic
     QWORD               ReloadTimeUs;
 
+    QWORD               ExpirationCount;
+    DWORD               StopGeneration;
+
     EX_TIMER_TYPE       Type;
 
     volatile BOOLEAN    TimerStarted;
+    BOOLEAN             TimerStopped;
     BOOLEAN             TimerUninited;
 } EX_TIMER, *PEX_TIMER;
+
+void
+ExTimerSystemPreinit(
+    void
+    );
+
+void
+ExTimerSystemTick(
+    void
+    );
 
 //******************************************************************************
 // Function:     ExTimerInit
