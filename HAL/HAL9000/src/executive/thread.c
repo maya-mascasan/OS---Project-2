@@ -177,6 +177,24 @@ _ThreadKernelFunction(
 
 static FUNC_ThreadStart     _IdleThread;
 
+void ThreadRecalculatePriority( INOUT PTHREAD Thread){
+    THREAD_PRIORITY highestPriority = Thread->BasePriority;
+    PLIST_ENTRY pEntry;
+    for (pEntry = Thread->HeldMutexesList.Flink;
+         pEntry != &Thread->HeldMutexesList;
+         pEntry = pEntry->Flink)
+    {
+        PMUTEX pMutex = CONTAINING_RECORD(pEntry, MUTEX, HeldListEntry);
+        if (!IsListEmpty(&pMutex->WaitingList))
+        {
+            PTHREAD pWaitingThread = CONTAINING_RECORD(pMutex->WaitingList.Flink, THREAD, ReadyList);
+            if (pWaitingThread->Priority > highestPriority)
+                highestPriority = pWaitingThread->Priority;
+        }
+    }
+    Thread->Priority = highestPriority;
+}
+
 void
 _No_competing_thread_
 ThreadSystemPreinit(
@@ -736,9 +754,10 @@ ThreadSetPriority(
     PTHREAD pThread = GetCurrentThread();
     THREAD_PRIORITY oldPriority = pThread->Priority;
 
-    pThread->Priority = NewPriority;
+    pThread->BasePriority = NewPriority;
+    ThreadRecalculatePriority(pThread);
 
-    if (NewPriority < oldPriority) {
+    if (pThread->Priority < oldPriority) {
         ThreadYield();
     }
 }
@@ -875,6 +894,10 @@ _ThreadInit(
         pThread->Id = _ThreadSystemGetNextTid();
         pThread->State = ThreadStateBlocked;
         pThread->Priority = Priority;
+
+        pThread->BasePriority = Priority;
+        pThread->CurrentBlockingMutex = NULL;
+        InitializeListHead(&pThread->HeldMutexesList);
 
         LockInit(&pThread->BlockLock);
         LockSetName(&pThread->BlockLock, "ThrBlock");

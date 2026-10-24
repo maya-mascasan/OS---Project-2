@@ -43,6 +43,11 @@ typedef struct _THREAD
 
     // Currently the thread priority is not used for anything
     THREAD_PRIORITY         Priority;
+
+    THREAD_PRIORITY         BasePriority;
+    struct _MUTEX*          CurrentBlockingMutex;
+    LIST_ENTRY              HeldMutexesList;
+
     THREAD_STATE            State;
 
     // valid only if State == ThreadStateTerminated
@@ -296,4 +301,9 @@ SetCurrentThread(
 void
 ThreadSetPriority(
     IN      THREAD_PRIORITY     NewPriority
+    );
+
+void
+ThreadRecalculatePriority(
+    INOUT   PTHREAD             Thread
     );
