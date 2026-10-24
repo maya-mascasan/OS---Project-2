@@ -2,7 +2,14 @@
 #include "thread_internal.h"
 #include "mutex.h"
 
+
 #define MUTEX_MAX_RECURSIVITY_DEPTH         MAX_BYTE
+
+extern INT64 CDECL CompareFunction(
+    IN      PLIST_ENTRY     FirstElem,
+    IN      PLIST_ENTRY     SecondElem,
+    IN_OPT  PVOID           Context
+);
 
 typedef struct _MUTEX_SYSTEM_DATA
 {
@@ -122,7 +129,8 @@ MutexAcquire(
 
     while (Mutex->Holder != pCurrentThread)
     {
-        InsertTailList(&Mutex->WaitingList, &pCurrentThread->ReadyList);
+        //InsertTailList(&Mutex->WaitingList, &pCurrentThread->ReadyList);
+        InsertOrderedList(&Mutex->WaitingList, &pCurrentThread->ReadyList, CompareFunction, NULL);
         ThreadTakeBlockLock();
         LockRelease(&Mutex->MutexLock, dummyState);
         ThreadBlock();
