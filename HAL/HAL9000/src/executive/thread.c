@@ -14,6 +14,7 @@
 #include "cal_atomic.h"
 #include "cal_assembly.h"
 #include "cal_seh.h"
+#include "smp.h"
 
 #define TID_INCREMENT               4
 
@@ -57,6 +58,41 @@ _ThreadSystemGetNextTid(
     static volatile TID __currentTid = 0;
 
     return AtomicExchangeAdd64(&__currentTid, TID_INCREMENT);
+}
+
+// compare function used for sorting 
+INT64 CDECL CompareFunction(
+    IN PLIST_ENTRY a,
+    IN PLIST_ENTRY b,
+    IN_OPT  PVOID Context
+)
+{
+    UNREFERENCED_PARAMETER(Context);
+
+    PTHREAD th1 = CONTAINING_RECORD(a, THREAD, ReadyList);
+    PTHREAD th2 = CONTAINING_RECORD(b, THREAD, ReadyList);
+
+    THREAD_PRIORITY p1 = ThreadGetPriority(th1);
+    THREAD_PRIORITY p2 = ThreadGetPriority(th2);
+
+    if (p1 > p2) {
+        return -1;
+    } else if (p1 < p2) {
+        return 1;
+    }
+    
+    return 0;
+}
+
+static STATUS CDECL ThreadYieldForIpi(
+    IN_OPT PVOID Context
+    )
+{
+    UNREFERENCED_PARAMETER(Context);
+    
+    GetCurrentPcpu()->ThreadData.YieldOnInterruptReturn = TRUE;
+    
+    return STATUS_SUCCESS;
 }
 
 static
@@ -508,7 +544,8 @@ ThreadYield(
     LockAcquire(&m_threadSystemData.ReadyThreadsLock, &dummyState);
     if (pThread != pCpu->ThreadData.IdleThread)
     {
-        InsertTailList(&m_threadSystemData.ReadyThreadsList, &pThread->ReadyList);
+        //InsertTailList(&m_threadSystemData.ReadyThreadsList, &pThread->ReadyList);
+        InsertOrderedList(&m_threadSystemData.ReadyThreadsList, &pThread->ReadyList, CompareFunction, NULL);
     }
     if (!bForcedYield)
     {
@@ -563,10 +600,18 @@ ThreadUnblock(
     ASSERT(ThreadStateBlocked == Thread->State);
 
     LockAcquire(&m_threadSystemData.ReadyThreadsLock, &dummyState);
-    InsertTailList(&m_threadSystemData.ReadyThreadsList, &Thread->ReadyList);
+    //InsertTailList(&m_threadSystemData.ReadyThreadsList, &Thread->ReadyList);
+    InsertOrderedList(&m_threadSystemData.ReadyThreadsList, &Thread->ReadyList, CompareFunction, NULL);
     Thread->State = ThreadStateReady;
     LockRelease(&m_threadSystemData.ReadyThreadsLock, dummyState );
     LockRelease(&Thread->BlockLock, oldState);
+
+    if (ThreadGetPriority(Thread) > ThreadGetPriority(GetCurrentThread())) {
+        SmpSendGenericIpi(ThreadYieldForIpi, NULL, NULL, NULL, FALSE);
+        GetCurrentPcpu()->ThreadData.YieldOnInterruptReturn = TRUE;
+    }
+        
+
 }
 
 void
@@ -685,13 +730,19 @@ ThreadGetPriority(
 
 void
 ThreadSetPriority(
-    IN      THREAD_PRIORITY     NewPriority
+    IN      THREAD_PRIORITY         NewPriority
     )
 {
-    ASSERT(ThreadPriorityLowest <= NewPriority && NewPriority <= ThreadPriorityMaximum);
+    PTHREAD pThread = GetCurrentThread();
+    THREAD_PRIORITY oldPriority = pThread->Priority;
 
-    GetCurrentThread()->Priority = NewPriority;
+    pThread->Priority = NewPriority;
+
+    if (NewPriority < oldPriority) {
+        ThreadYield();
+    }
 }
+
 
 STATUS
 ThreadExecuteForEachThreadEntry(

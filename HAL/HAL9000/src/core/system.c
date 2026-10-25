@@ -117,7 +117,7 @@ SystemInit(
     kernelBaseAddress = (PVOID) ((QWORD) BootInformation->KernelBaseAddress);
     kernelSize = BootInformation->KernelSize;
 
-    LogSystemInit(LogLevelInfo,
+    LogSystemInit(LogLevelError,
                   LogComponentInterrupt | LogComponentIo | LogComponentAcpi | LogComponentUserMode,
                   TRUE
                   );

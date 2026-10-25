@@ -2,8 +2,13 @@
 #include "ex_event.h"
 #include "thread_internal.h"
 #include "cal_atomic.h"
-
 #include "cpumu.h"
+
+extern INT64 CDECL CompareFunction(
+    IN      PLIST_ENTRY     FirstElem,
+    IN      PLIST_ENTRY     SecondElem,
+    IN_OPT  PVOID           Context
+);
 
 typedef struct EX_EVENT_SYSTEM_DATA
 {
@@ -162,7 +167,8 @@ ExEventWaitForSignal(
     while (TRUE != AtomicCompareExchange8(&Event->Signaled, newState, TRUE))
     {
         LockAcquire(&Event->EventLock, &dummyState);
-        InsertTailList(&Event->WaitingList, &pCurrentThread->ReadyList);
+        //InsertTailList(&Event->WaitingList, &pCurrentThread->ReadyList);
+        InsertOrderedList(&Event->WaitingList, &pCurrentThread->ReadyList, CompareFunction, NULL);
         ThreadTakeBlockLock();
         LockRelease(&Event->EventLock, dummyState);
         ThreadBlock();
