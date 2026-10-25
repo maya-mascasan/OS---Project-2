@@ -77,11 +77,9 @@ INT64 CDECL CompareFunction(
 
     if (p1 > p2) {
         return -1;
-    } else if (p1 < p2) {
-        return 1;
-    }
-    
-    return 0;
+    } 
+
+    return 1;
 }
 
 static STATUS CDECL ThreadYieldForIpi(
