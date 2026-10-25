@@ -65,6 +65,8 @@ MutexInit(
 
     InitializeListHead(&Mutex->WaitingList);
 
+    InitializeListHead(&Mutex->HeldListEntry);
+
     Mutex->MaxRecursivityDepth = Recursive ? MUTEX_MAX_RECURSIVITY_DEPTH : 1;
 
     LockAcquire(&m_mutexData.Lock, &oldState);
@@ -125,6 +127,24 @@ MutexAcquire(
     {
         Mutex->Holder = pCurrentThread;
         Mutex->CurrentRecursivityDepth = 1;
+        InsertTailList(&pCurrentThread->HeldMutexesList, &Mutex->HeldListEntry);
+    }
+    else{
+        pCurrentThread->CurrentBlockingMutex = Mutex;
+        PTHREAD pChainThread = Mutex->Holder;
+        PMUTEX pChainMutex = Mutex;
+        DWORD depth = 0;
+        while (pChainThread != NULL && depth < 8)
+        {
+            if (pCurrentThread->Priority > pChainThread->Priority)
+                pChainThread->Priority = pCurrentThread->Priority;
+            pChainMutex = pChainThread->CurrentBlockingMutex;
+            if (pChainMutex != NULL)
+                pChainThread = pChainMutex->Holder;
+            else
+                break;
+            depth++;
+        }
     }
 
     while (Mutex->Holder != pCurrentThread)
@@ -153,6 +173,7 @@ MutexRelease(
 {
     INTR_STATE oldState;
     PLIST_ENTRY pEntry;
+    PTHREAD pCurrentThread = GetCurrentThread();
 
     ASSERT(NULL != Mutex);
     ASSERT(GetCurrentThread() == Mutex->Holder);
@@ -167,6 +188,10 @@ MutexRelease(
 
     LockAcquire(&Mutex->MutexLock, &oldState);
 
+    RemoveEntryList(&Mutex->HeldListEntry);
+    InitializeListHead(&Mutex->HeldListEntry);
+    ThreadRecalculatePriority(pCurrentThread);
+    
     pEntry = RemoveHeadList(&Mutex->WaitingList);
     if (pEntry != &Mutex->WaitingList)
     {
