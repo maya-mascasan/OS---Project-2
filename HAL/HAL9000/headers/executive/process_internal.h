@@ -67,6 +67,9 @@ typedef struct _PROCESS
     MUTEX HandleTableLock;
     LIST_ENTRY HandleTableList;
     UM_HANDLE NextHandleValue;
+
+    BOOLEAN StdoutClosed;
+    
 } PROCESS, *PPROCESS;
 
 //******************************************************************************
