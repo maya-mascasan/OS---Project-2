@@ -476,6 +476,11 @@ _ProcessInit(
             __leave;
         }
 
+        InitializeListHead(&pProcess->HandleTableList);
+        MutexInit(&pProcess->HandleTableLock, FALSE);
+        MutexSetName(&pProcess->HandleTableLock, "HandleTable");
+        pProcess->NextHandleValue = 2;
+
         RfcPreInit(&pProcess->RefCnt);
 
         status = RfcInit(&pProcess->RefCnt, _ProcessDestroy, NULL);
@@ -754,6 +759,7 @@ _ProcessDestroy(
 
     ExEventDestroy(&Process->TerminationEvt);
     LockDestroy(&Process->ThreadListLock);
+    MutexDestroy(&Process->HandleTableLock); 
 
     if (NULL != Process->FullCommandLine)
     {

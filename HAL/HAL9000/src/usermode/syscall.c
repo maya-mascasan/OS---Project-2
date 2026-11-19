@@ -13,10 +13,107 @@
 #include "cal_annotate.h"
 #include "cal_assembly.h"
 #include "cal_seh.h"
+#include "vmm.h"
+#include "ex.h"
+#include "io.h"
+#include "iomu.h"
 
 extern void MS_ABI SyscallEntry();
 
 #define SYSCALL_IF_VERSION_KM       SYSCALL_IMPLEMENTED_IF_VERSION
+
+typedef enum {
+    UmHandleTypeProcess = 1,
+    UmHandleTypeThread,
+    UmHandleTypeFile
+} UM_HANDLE_TYPE;
+
+typedef struct UM_HANDLE_ENTRY {
+    LIST_ENTRY ListEntry;
+    UM_HANDLE HandleValue;
+    UM_HANDLE_TYPE HandleType;
+    PVOID KernelObject; 
+} UM_HANDLE_ENTRY;
+
+STATUS UmHandleAdd(PPROCESS process, UM_HANDLE_TYPE type, PVOID object, UM_HANDLE* OutHandle) {
+    UM_HANDLE_ENTRY *new = (UM_HANDLE_ENTRY*)ExAllocatePoolWithTag(0, sizeof(UM_HANDLE_ENTRY), 'hdle', 0);
+    if (!new)
+    {
+        return STATUS_HEAP_NO_MORE_MEMORY;
+    }
+
+    MutexAcquire(&process->HandleTableLock);
+    
+    UM_HANDLE id = process->NextHandleValue++;
+    new->HandleValue = id;
+    new->HandleType = type;
+    new->KernelObject = object;
+    InsertTailList(&process->HandleTableList, &new->ListEntry);
+    
+    MutexRelease(&process->HandleTableLock);
+    
+    *OutHandle = id;
+    
+    return STATUS_SUCCESS;
+}
+
+STATUS UmHandleGet(PPROCESS process, UM_HANDLE value, UM_HANDLE_TYPE expectedType, PVOID* object) {
+    STATUS status = STATUS_INVALID_PARAMETER1;
+    PLIST_ENTRY current;
+    UM_HANDLE_ENTRY *entry;
+
+    MutexAcquire(&process->HandleTableLock);
+    
+    current = process->HandleTableList.Flink;           
+    while (current != &process->HandleTableList) {     
+        entry = CONTAINING_RECORD(current, UM_HANDLE_ENTRY, ListEntry);
+
+        if (entry->HandleValue == value) {
+            if (entry->HandleType == expectedType) {
+                *object = entry->KernelObject;
+                status = STATUS_SUCCESS;
+            } else {
+                status = STATUS_INVALID_PARAMETER1;
+            }
+            break;
+        }
+
+        current = current->Flink;                        
+    }
+    
+    MutexRelease(&process->HandleTableLock);
+    return status;
+}
+
+STATUS UmHandleRemove(PPROCESS process, UM_HANDLE value, UM_HANDLE_TYPE expectedType, PVOID* object) {
+    STATUS status = STATUS_INVALID_PARAMETER1;
+    PLIST_ENTRY current;
+    UM_HANDLE_ENTRY *entry;
+
+    MutexAcquire(&process->HandleTableLock);
+
+    current = process->HandleTableList.Flink;     
+    while (current != &process->HandleTableList) {     
+        entry = CONTAINING_RECORD(current, UM_HANDLE_ENTRY, ListEntry);
+
+        if (entry->HandleValue == value) {
+            if (entry->HandleType == expectedType) {
+                *object = entry->KernelObject;
+                RemoveEntryList(current);
+                ExFreePoolWithTag(entry, 'hdle');
+                status = STATUS_SUCCESS;
+            } else {
+                status = STATUS_INVALID_PARAMETER1;
+            }
+            break;
+        }
+
+        current = current->Flink;                        
+    }
+    
+    MutexRelease(&process->HandleTableLock);
+    return status;
+}
 
 void
 MS_ABI
@@ -89,6 +186,32 @@ SyscallHandler(
             );
             break;
         // STUDENT TODO: implement the rest of the syscalls 
+        case SyscallIdProcessGetPid:
+            status = SyscallProcessGetPid(
+                (UM_HANDLE)pSyscallParameters[0],
+                (PID*)pSyscallParameters[1]
+            );
+            break;
+        case SyscallIdProcessCreate:
+            status = SyscallProcessCreate(
+                (char*)pSyscallParameters[0],
+                (QWORD)pSyscallParameters[1],
+                (char*)pSyscallParameters[2],
+                (QWORD)pSyscallParameters[3],
+                (UM_HANDLE*)pSyscallParameters[4]
+            );
+            break;
+        case SyscallIdProcessWaitForTermination:
+            status = SyscallProcessWaitForTermination(
+                (UM_HANDLE)pSyscallParameters[0],
+                (STATUS*)pSyscallParameters[1]
+            );
+            break;
+        case SyscallIdProcessCloseHandle:
+            status = SyscallProcessCloseHandle(
+                (UM_HANDLE)pSyscallParameters[0]
+            );
+            break;
         default:
             LOG_ERROR("Unimplemented syscall called from User-space!\n");
             status = STATUS_UNSUPPORTED;
@@ -235,3 +358,185 @@ SyscallFileWrite(
 }
 
 // STUDENT TODO: implement the rest of the syscalls
+STATUS
+SyscallProcessGetPid(
+    IN_OPT  UM_HANDLE               ProcessHandle,
+    OUT     PID*                    ProcessId
+)
+{
+    PPROCESS process = GetCurrentProcess();
+    PPROCESS target = NULL; 
+    STATUS status;
+
+    status = MmuIsBufferValid(ProcessId, sizeof(PID), PAGE_RIGHTS_WRITE, process); 
+    if (ProcessId == NULL || !SUCCEEDED(status))
+    {
+        return STATUS_INVALID_PARAMETER2;
+    }
+
+    status = UmHandleGet(process, ProcessHandle, UmHandleTypeProcess, (PVOID*)&target);
+    if (ProcessHandle != UM_INVALID_HANDLE_VALUE && !SUCCEEDED(status))
+    {
+        return STATUS_INVALID_PARAMETER1;
+    }
+
+    *ProcessId = ProcessGetId(target);
+    return STATUS_SUCCESS;
+}
+
+STATUS
+SyscallProcessCreate(
+    IN_READS_Z(PathLength)
+                char*               ProcessPath,
+    IN          QWORD               PathLength,
+    IN_READS_OPT_Z(ArgLength)
+                char*               Arguments,
+    IN          QWORD               ArgLength,
+    OUT         UM_HANDLE*          ProcessHandle
+)
+{
+    STATUS status;
+    PPROCESS process = GetCurrentProcess();
+    char* fullPath = NULL;
+    BOOLEAN ok = FALSE; // ok = true for absolute path
+
+    if (ProcessHandle == NULL || ProcessPath == NULL || PathLength == 0)
+    {
+        return STATUS_INVALID_PARAMETER1;
+    }
+
+    status = MmuIsBufferValid((PVOID)ProcessHandle, sizeof(UM_HANDLE), PAGE_RIGHTS_WRITE, process); 
+    if (!SUCCEEDED(status)) 
+    {
+        return status;
+    }
+
+    status = MmuIsBufferValid((PVOID)ProcessPath, PathLength, PAGE_RIGHTS_READ, process); 
+    if (!SUCCEEDED(status)) 
+    {
+        return status;
+    }
+
+    if (Arguments != NULL)
+    {
+        if (ArgLength == 0) return STATUS_INVALID_PARAMETER3;
+        status = MmuIsBufferValid((PVOID)Arguments, ArgLength, PAGE_RIGHTS_READ, process); 
+        if (!SUCCEEDED(status)) 
+        {
+            return status;
+        }
+    }
+    
+
+    //if absolute path "D:\Sample.exe"
+    if (PathLength >= 3 && ProcessPath[1] == ':' && ProcessPath[2] == '\\')
+    {
+        ok = TRUE;
+    }
+
+    if (ok)
+    {
+        fullPath = (char*)ProcessPath;
+    }
+    else
+    {
+        // relative path 
+        const char* drive = IomuGetSystemPartitionPath();
+        const char* dir = "Applications\\";
+        
+        QWORD lenSystem = 0;
+        while (drive[lenSystem] != '\0') lenSystem++;
+        
+        QWORD lenApp = 0;
+        while (dir[lenApp] != '\0') lenApp++;
+        
+        QWORD totalLen = lenSystem + lenApp + PathLength + 1;
+        
+        fullPath = (char*)ExAllocatePoolWithTag(0, totalLen, 'path', 0);
+        if (fullPath == NULL)
+        {
+            return STATUS_HEAP_NO_MORE_MEMORY;
+        }
+
+        QWORD offset = 0;
+        for (QWORD i = 0; i < lenSystem; i++) 
+            fullPath[offset++] = drive[i];
+        for (QWORD i = 0; i < lenApp; i++) 
+            fullPath[offset++] = dir[i];
+        for (QWORD i = 0; i < PathLength; i++) 
+            fullPath[offset++] = ProcessPath[i];
+        fullPath[offset] = '\0';
+    }
+
+    PPROCESS newProcess = NULL;
+    status = ProcessCreate(fullPath, Arguments, &newProcess);
+
+    if (fullPath != ProcessPath)
+    {
+        ExFreePoolWithTag(fullPath, 'path');
+    }
+
+    if (!SUCCEEDED(status)) 
+    {
+        return status;
+    }
+
+    status = UmHandleAdd(process, UmHandleTypeProcess, newProcess, ProcessHandle);
+
+    return status;
+}
+
+STATUS
+SyscallProcessWaitForTermination(
+    IN  UM_HANDLE               ProcessHandle,
+    OUT STATUS*                 TerminationStatus
+)
+{
+    STATUS status;
+    STATUS exitStatus;
+    PPROCESS target = NULL;
+    PPROCESS process = GetCurrentProcess();
+    
+    status = UmHandleGet(process, ProcessHandle, UmHandleTypeProcess, (PVOID*)&target);
+    if (!SUCCEEDED(status)) 
+    {
+        return status;
+    }
+    
+    if (TerminationStatus != NULL)
+    {
+        status = MmuIsBufferValid((PVOID)TerminationStatus, sizeof(STATUS), PAGE_RIGHTS_WRITE, process);
+        if (!SUCCEEDED(status)) 
+        {
+            return STATUS_INVALID_PARAMETER2;
+        }
+    }
+    
+    ProcessWaitForTermination(target, &exitStatus);
+    
+    if (TerminationStatus != NULL)
+    {
+        *TerminationStatus = exitStatus;
+    }
+    
+    return STATUS_SUCCESS;
+}
+
+STATUS
+SyscallProcessCloseHandle(
+    IN  UM_HANDLE               ProcessHandle
+)
+{
+    PPROCESS target = NULL;
+    PPROCESS process = GetCurrentProcess();
+    
+    STATUS status = UmHandleRemove(process, ProcessHandle, UmHandleTypeProcess, (PVOID*)&target);
+    if (!SUCCEEDED(status)) 
+    {
+        return status;
+    }
+    
+    ProcessCloseHandle(target);
+    
+    return STATUS_SUCCESS;
+}
