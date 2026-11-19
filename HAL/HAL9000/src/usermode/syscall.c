@@ -212,6 +212,50 @@ SyscallHandler(
                 (UM_HANDLE)pSyscallParameters[0]
             );
             break;
+        case SyscallIdFileClose:
+            status = SyscallFileClose((UM_HANDLE)pSyscallParameters[0]);
+            break;
+        case SyscallIdFileCreate:
+            status = SyscallFileCreate(
+                (char*)pSyscallParameters[0],
+                (QWORD)pSyscallParameters[1],
+                (BOOLEAN)pSyscallParameters[2],
+                (BOOLEAN)pSyscallParameters[3],
+                (UM_HANDLE*)pSyscallParameters[4]
+            );
+            break;
+        case SyscallIdFileRead:
+            status = SyscallFileRead(
+                (UM_HANDLE)pSyscallParameters[0],
+                (PVOID)pSyscallParameters[1],
+                (QWORD)pSyscallParameters[2],
+                (QWORD*)pSyscallParameters[3]
+            );
+            break;
+        case SyscallIdThreadCreate:
+            status = SyscallThreadCreate(
+                (PFUNC_ThreadStart)pSyscallParameters[0],
+                (PVOID)pSyscallParameters[1],
+                (UM_HANDLE*)pSyscallParameters[2]
+            );
+            break;
+        case SyscallIdThreadGetTid:
+            status = SyscallThreadGetTid(
+                (UM_HANDLE)pSyscallParameters[0],
+                (TID*)pSyscallParameters[1]
+            );
+            break;
+        case SyscallIdThreadWaitForTermination:
+            status = SyscallThreadWaitForTermination(
+                (UM_HANDLE)pSyscallParameters[0],
+                (STATUS*)pSyscallParameters[1]
+            );
+            break;
+        case SyscallIdThreadCloseHandle:
+            status = SyscallThreadCloseHandle(
+                (UM_HANDLE)pSyscallParameters[0]
+            );
+            break;
         default:
             LOG_ERROR("Unimplemented syscall called from User-space!\n");
             status = STATUS_UNSUPPORTED;
@@ -349,6 +393,8 @@ SyscallFileWrite(
 
     if (FileHandle == UM_FILE_HANDLE_STDOUT) {
         *BytesWritten = BytesToWrite;
+        if (GetCurrentProcess()->StdoutClosed)
+            return STATUS_SUCCESS;
         LOG("[%s]:[%s]\n", ProcessGetName(NULL), Buffer);
         return STATUS_SUCCESS;
     }
@@ -538,5 +584,201 @@ SyscallProcessCloseHandle(
     
     ProcessCloseHandle(target);
     
+    return STATUS_SUCCESS;
+}
+
+STATUS
+SyscallFileClose(
+    IN UM_HANDLE FileHandle
+)
+{
+    PFILE_OBJECT pFile = NULL;
+    PPROCESS currentProcess = GetCurrentProcess();
+    STATUS status;
+    if (FileHandle == UM_FILE_HANDLE_STDOUT)
+    {
+        status = STATUS_SUCCESS;
+        MutexAcquire(&currentProcess->HandleTableLock);
+        if (currentProcess->StdoutClosed)
+            status = STATUS_INVALID_PARAMETER1;
+        else
+            currentProcess->StdoutClosed = TRUE;
+        MutexRelease(&currentProcess->HandleTableLock);
+        return status;
+    }
+    status = UmHandleRemove(currentProcess, FileHandle, UmHandleTypeFile, (PVOID*)&pFile);
+    if (!SUCCEEDED(status)) 
+        return status;
+    return IoCloseFile(pFile);
+}
+
+STATUS
+SyscallFileCreate(
+    IN_READS_Z(PathLength) char* Path,
+    IN QWORD PathLength,
+    IN BOOLEAN Directory,
+    IN BOOLEAN Create,
+    OUT UM_HANDLE* FileHandle
+)
+{
+    STATUS status;
+    PPROCESS currentProcess = GetCurrentProcess();
+    PFILE_OBJECT pFile = NULL;
+    const char* prefix = "";
+    QWORD prefixLen = 0;
+    QWORD pathLen = 0;
+    QWORD offset = 0;
+    char* fullPath = NULL;
+    if (PathLength > MAX_PATH)
+        return STATUS_INVALID_PARAMETER1;
+    status = MmuIsBufferValid((PVOID)FileHandle, sizeof(UM_HANDLE), PAGE_RIGHTS_WRITE, currentProcess);
+    if (!SUCCEEDED(status)) 
+        return STATUS_INVALID_PARAMETER5;
+    status = MmuIsBufferValid((PVOID)Path, PathLength, PAGE_RIGHTS_READ, currentProcess);
+    if (!SUCCEEDED(status)) 
+        return STATUS_INVALID_PARAMETER1;
+    while (pathLen < PathLength && Path[pathLen] != '\0') 
+        pathLen++;
+    if (pathLen == 0)
+        return STATUS_INVALID_PARAMETER1;
+    if (!(pathLen >= 3 && Path[1] == ':' && Path[2] == '\\'))
+    {
+        prefix = IomuGetSystemPartitionPath();
+        while (prefix[prefixLen] != '\0') prefixLen++;
+    }
+    fullPath = (char*)ExAllocatePoolWithTag(PoolAllocateZeroMemory, (DWORD)(prefixLen + pathLen + 1), 'eliF', 0);
+    if (fullPath == NULL) 
+        return STATUS_HEAP_NO_MORE_MEMORY;
+    for (QWORD i = 0; i < prefixLen; i++) 
+        fullPath[offset++] = prefix[i];
+    for (QWORD i = 0; i < pathLen; i++) 
+        fullPath[offset++] = Path[i];
+    fullPath[offset] = '\0';
+    status = IoCreateFile(&pFile, fullPath, Directory, Create, FALSE);
+    ExFreePoolWithTag(fullPath, 'eliF');
+    if (!SUCCEEDED(status)) 
+        return status;
+    status = UmHandleAdd(currentProcess, UmHandleTypeFile, pFile, FileHandle);
+    if (!SUCCEEDED(status))
+    {
+        IoCloseFile(pFile);
+        return status;
+    }
+    return STATUS_SUCCESS;
+}
+
+STATUS
+SyscallFileRead(
+    IN UM_HANDLE FileHandle,
+    OUT_WRITES_BYTES(BytesToRead) PVOID Buffer,
+    IN QWORD BytesToRead,
+    OUT QWORD* BytesRead
+)
+{
+    STATUS status;
+    PPROCESS currentProcess = GetCurrentProcess();
+    PFILE_OBJECT pFile = NULL;
+    QWORD bytesRead = 0;
+    status = MmuIsBufferValid((PVOID)BytesRead, sizeof(QWORD), PAGE_RIGHTS_WRITE, currentProcess);
+    if (!SUCCEEDED(status))
+        return STATUS_INVALID_PARAMETER4;
+    status = UmHandleGet(currentProcess, FileHandle, UmHandleTypeFile, (PVOID*)&pFile);
+    if (!SUCCEEDED(status)) 
+        return STATUS_INVALID_PARAMETER1;
+    if (BytesToRead == 0)
+    {
+        *BytesRead = 0;
+        return STATUS_SUCCESS;
+    }
+    status = MmuIsBufferValid(Buffer, BytesToRead, PAGE_RIGHTS_WRITE, currentProcess);
+    if (!SUCCEEDED(status)) 
+        return STATUS_INVALID_PARAMETER2;
+    status = IoReadFile(pFile, BytesToRead, NULL, Buffer, &bytesRead);
+    if (!SUCCEEDED(status)) 
+        return status;
+    *BytesRead = bytesRead;
+    return STATUS_SUCCESS;
+}
+
+STATUS
+SyscallThreadCreate(
+    IN PFUNC_ThreadStart StartFunction,
+    IN_OPT PVOID Context,
+    OUT UM_HANDLE* ThreadHandle
+)
+{
+    STATUS status;
+    PPROCESS currentProcess = GetCurrentProcess();
+    PTHREAD pThread = NULL;
+    status = MmuIsBufferValid((PVOID)ThreadHandle, sizeof(UM_HANDLE), PAGE_RIGHTS_WRITE, currentProcess);
+    if (!SUCCEEDED(status)) 
+        return STATUS_INVALID_PARAMETER3;
+    status = ThreadCreateEx("UmThread", ThreadPriorityDefault, StartFunction, Context, &pThread, currentProcess);
+    if (!SUCCEEDED(status)) 
+        return status;
+    status = UmHandleAdd(currentProcess, UmHandleTypeThread, pThread, ThreadHandle);
+    if (!SUCCEEDED(status))
+    {
+        ThreadCloseHandle(pThread);
+        return status;
+    }
+    return STATUS_SUCCESS;
+}
+
+STATUS
+SyscallThreadGetTid(
+    IN_OPT UM_HANDLE ThreadHandle,
+    OUT TID* ThreadId
+)
+{
+    STATUS status;
+    PPROCESS currentProcess = GetCurrentProcess();
+    PTHREAD pThread = NULL;
+    status = MmuIsBufferValid((PVOID)ThreadId, sizeof(TID), PAGE_RIGHTS_WRITE, currentProcess);
+    if (!SUCCEEDED(status)) 
+        return STATUS_INVALID_PARAMETER2;
+    if (ThreadHandle == UM_INVALID_HANDLE_VALUE)
+    {
+        *ThreadId = ThreadGetId(NULL);
+        return STATUS_SUCCESS;
+    }
+    status = UmHandleGet(currentProcess, ThreadHandle, UmHandleTypeThread, (PVOID*)&pThread);
+    if (!SUCCEEDED(status)) 
+        return STATUS_INVALID_PARAMETER1;
+    *ThreadId = ThreadGetId(pThread);
+    return STATUS_SUCCESS;
+}
+
+STATUS
+SyscallThreadWaitForTermination(
+    IN UM_HANDLE ThreadHandle,
+    OUT STATUS* TerminationStatus
+)
+{
+    STATUS status;
+    STATUS exitStatus;
+    PPROCESS currentProcess = GetCurrentProcess();
+    PTHREAD pThread = NULL;
+    status = MmuIsBufferValid((PVOID)TerminationStatus, sizeof(STATUS), PAGE_RIGHTS_WRITE, currentProcess);
+    if (!SUCCEEDED(status)) 
+        return STATUS_INVALID_PARAMETER2;
+    status = UmHandleGet(currentProcess, ThreadHandle, UmHandleTypeThread, (PVOID*)&pThread);
+    if (!SUCCEEDED(status)) 
+        return STATUS_INVALID_PARAMETER1;
+    ThreadWaitForTermination(pThread, &exitStatus);
+    *TerminationStatus = exitStatus;
+    return STATUS_SUCCESS;
+}
+
+STATUS
+SyscallThreadCloseHandle(
+    IN UM_HANDLE ThreadHandle
+)
+{
+    PTHREAD pThread = NULL;
+    STATUS status = UmHandleRemove(GetCurrentProcess(), ThreadHandle, UmHandleTypeThread, (PVOID*)&pThread);
+    if (!SUCCEEDED(status)) 
+        return status;
+    ThreadCloseHandle(pThread);
     return STATUS_SUCCESS;
 }
