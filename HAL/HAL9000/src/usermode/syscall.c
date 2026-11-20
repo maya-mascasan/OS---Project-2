@@ -17,6 +17,7 @@
 #include "ex.h"
 #include "io.h"
 #include "iomu.h"
+#include "cpumu.h"
 
 extern void MS_ABI SyscallEntry();
 
@@ -124,6 +125,7 @@ SyscallHandler(
     SYSCALL_ID sysCallId;
     PQWORD pSyscallParameters;
     PQWORD pParameters;
+    QWORD parameterBufferSize;
     STATUS status;
     REGISTER_AREA* usermodeProcessorState;
 
@@ -151,14 +153,38 @@ SyscallHandler(
 
         // Check if indeed the shadow stack is valid (the shadow stack is mandatory)
         pParameters = (PQWORD)usermodeProcessorState->RegisterValues[RegisterRbp];
-        status = MmuIsBufferValid(pParameters, SHADOW_STACK_SIZE, PAGE_RIGHTS_READ, GetCurrentProcess());
+        sysCallId = usermodeProcessorState->RegisterValues[RegisterR8];
+
+        parameterBufferSize = SHADOW_STACK_SIZE;
+        switch (sysCallId)
+        {
+        case SyscallIdProcessCreate:
+        case SyscallIdFileCreate:
+            parameterBufferSize = 6 * sizeof(QWORD);
+            break;
+        case SyscallIdFileWrite:
+        case SyscallIdFileRead:
+            parameterBufferSize = 5 * sizeof(QWORD);
+            break;
+        case SyscallIdProcessGetPid:
+        case SyscallIdProcessWaitForTermination:
+        case SyscallIdThreadGetTid:
+        case SyscallIdThreadWaitForTermination:
+            parameterBufferSize = 3 * sizeof(QWORD);
+            break;
+        case SyscallIdThreadCreate:
+            parameterBufferSize = 4 * sizeof(QWORD);
+            break;
+        default:
+            break;
+        }
+
+        status = MmuIsBufferValid(pParameters, parameterBufferSize, PAGE_RIGHTS_READ, GetCurrentProcess());
         if (!SUCCEEDED(status))
         {
             LOG_FUNC_ERROR("MmuIsBufferValid", status);
             __leave;
         }
-
-        sysCallId = usermodeProcessorState->RegisterValues[RegisterR8];
 
         LOG_TRACE_USERMODE("System call ID is %u\n", sysCallId);
 
@@ -387,8 +413,22 @@ SyscallFileWrite(
     OUT QWORD* BytesWritten
 )
 {
-    if (BytesWritten == NULL) {
-        return STATUS_UNSUCCESSFUL;
+    PPROCESS process = GetCurrentProcess();
+    STATUS status;
+
+    status = MmuIsBufferValid(BytesWritten, sizeof(QWORD), PAGE_RIGHTS_WRITE, process);
+    if (!SUCCEEDED(status))
+    {
+        return STATUS_INVALID_PARAMETER4;
+    }
+
+    if (BytesToWrite != 0)
+    {
+        status = MmuIsBufferValid(Buffer, BytesToWrite, PAGE_RIGHTS_READ, process);
+        if (!SUCCEEDED(status))
+        {
+            return STATUS_INVALID_PARAMETER2;
+        }
     }
 
     if (FileHandle == UM_FILE_HANDLE_STDOUT) {
@@ -444,38 +484,76 @@ SyscallProcessCreate(
     STATUS status;
     PPROCESS process = GetCurrentProcess();
     char* fullPath = NULL;
+    QWORD pathSize;
     BOOLEAN ok = FALSE; // ok = true for absolute path
 
-    if (ProcessHandle == NULL || ProcessPath == NULL || PathLength == 0)
+    if (ProcessPath == NULL)
     {
         return STATUS_INVALID_PARAMETER1;
+    }
+
+    if (PathLength == 0 || PathLength > MAX_PATH)
+    {
+        return STATUS_INVALID_PARAMETER2;
+    }
+
+    if (ProcessHandle == NULL)
+    {
+        return STATUS_INVALID_PARAMETER5;
     }
 
     status = MmuIsBufferValid((PVOID)ProcessHandle, sizeof(UM_HANDLE), PAGE_RIGHTS_WRITE, process); 
     if (!SUCCEEDED(status)) 
     {
-        return status;
+        return STATUS_INVALID_PARAMETER5;
     }
 
     status = MmuIsBufferValid((PVOID)ProcessPath, PathLength, PAGE_RIGHTS_READ, process); 
     if (!SUCCEEDED(status)) 
     {
-        return status;
+        return STATUS_INVALID_PARAMETER1;
+    }
+
+    for (pathSize = 0; pathSize < PathLength && ProcessPath[pathSize] != '\0'; pathSize++)
+    {
+    }
+    if (pathSize == 0 || pathSize == PathLength)
+    {
+        return STATUS_INVALID_PARAMETER1;
     }
 
     if (Arguments != NULL)
     {
-        if (ArgLength == 0) return STATUS_INVALID_PARAMETER3;
+        QWORD argumentIndex;
+
+        if (ArgLength == 0 || ArgLength > STACK_DEFAULT_SIZE)
+        {
+            return STATUS_INVALID_PARAMETER3;
+        }
+
         status = MmuIsBufferValid((PVOID)Arguments, ArgLength, PAGE_RIGHTS_READ, process); 
         if (!SUCCEEDED(status)) 
         {
-            return status;
+            return STATUS_INVALID_PARAMETER3;
+        }
+
+        for (argumentIndex = 0;
+             argumentIndex < ArgLength && Arguments[argumentIndex] != '\0';
+             argumentIndex++)
+        {
+        }
+        if (argumentIndex == ArgLength)
+        {
+            return STATUS_INVALID_PARAMETER3;
         }
     }
-    
+    else if (ArgLength != 0)
+    {
+        return STATUS_INVALID_PARAMETER4;
+    }
 
     //if absolute path "D:\Sample.exe"
-    if (PathLength >= 3 && ProcessPath[1] == ':' && ProcessPath[2] == '\\')
+    if (pathSize >= 3 && ProcessPath[1] == ':' && ProcessPath[2] == '\\')
     {
         ok = TRUE;
     }
@@ -496,7 +574,7 @@ SyscallProcessCreate(
         QWORD lenApp = 0;
         while (dir[lenApp] != '\0') lenApp++;
         
-        QWORD totalLen = lenSystem + lenApp + PathLength + 1;
+        QWORD totalLen = lenSystem + lenApp + pathSize + 1;
         
         fullPath = (char*)ExAllocatePoolWithTag(0, totalLen, 'path', 0);
         if (fullPath == NULL)
@@ -509,7 +587,7 @@ SyscallProcessCreate(
             fullPath[offset++] = drive[i];
         for (QWORD i = 0; i < lenApp; i++) 
             fullPath[offset++] = dir[i];
-        for (QWORD i = 0; i < PathLength; i++) 
+        for (QWORD i = 0; i < pathSize; i++)
             fullPath[offset++] = ProcessPath[i];
         fullPath[offset] = '\0';
     }
@@ -713,6 +791,9 @@ SyscallThreadCreate(
     status = MmuIsBufferValid((PVOID)ThreadHandle, sizeof(UM_HANDLE), PAGE_RIGHTS_WRITE, currentProcess);
     if (!SUCCEEDED(status)) 
         return STATUS_INVALID_PARAMETER3;
+    status = MmuIsBufferValid((PVOID)StartFunction, sizeof(BYTE), PAGE_RIGHTS_EXECUTE, currentProcess);
+    if (!SUCCEEDED(status))
+        return STATUS_INVALID_PARAMETER1;
     status = ThreadCreateEx("UmThread", ThreadPriorityDefault, StartFunction, Context, &pThread, currentProcess);
     if (!SUCCEEDED(status)) 
         return status;

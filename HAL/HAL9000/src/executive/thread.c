@@ -5,6 +5,7 @@
 #include "ex_event.h"
 #include "core.h"
 #include "vmm.h"
+#include "mmu.h"
 #include "exe_loader.h"
 #include "process_internal.h"
 #include "isr.h"
@@ -978,11 +979,114 @@ _ThreadSetupMainThreadUserStack(
     IN      PPROCESS            Process
     )
 {
+    STATUS status;
+    QWORD commandLineSize;
+    QWORD argumentVectorSize;
+    QWORD commandLineAddress;
+    QWORD argumentVectorAddress;
+    QWORD stackAddress;
+    QWORD stackSize;
+    QWORD requiredSize;
+    QWORD argumentCount;
+    QWORD argumentOffset;
+    PVOID kernelStack;
+    char* userCommandLine;
+    char* kernelCommandLine;
+    char* pCommandLine;
+    PVOID* pArguments;
+    const char* pArgument;
+    DWORD argumentIndex;
+
     ASSERT(InitialStack != NULL);
     ASSERT(ResultingStack != NULL);
     ASSERT(Process != NULL);
+    ASSERT(Process->FullCommandLine != NULL);
 
-    *ResultingStack = (PVOID) PtrDiff(InitialStack, SHADOW_STACK_SIZE + sizeof(PVOID));
+    argumentCount = 0;
+    pArgument = Process->FullCommandLine;
+    while (*pArgument != '\0')
+    {
+        while (*pArgument == ' ')
+        {
+            pArgument++;
+        }
+
+        if (*pArgument == '\0')
+        {
+            break;
+        }
+
+        argumentCount++;
+        while (*pArgument != '\0' && *pArgument != ' ')
+        {
+            pArgument++;
+        }
+    }
+
+    if (argumentCount == 0 || argumentCount > MAX_DWORD)
+    {
+        return STATUS_INVALID_PARAMETER3;
+    }
+
+    Process->NumberOfArguments = (DWORD)argumentCount;
+
+    commandLineSize = strlen(Process->FullCommandLine) + 1;
+    argumentVectorSize = (argumentCount + 1) * sizeof(PVOID);
+    requiredSize = commandLineSize + argumentVectorSize + SHADOW_STACK_SIZE + sizeof(PVOID) + 15;
+    if (requiredSize > STACK_DEFAULT_SIZE)
+    {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+
+    commandLineAddress = (QWORD)InitialStack - commandLineSize;
+    argumentVectorAddress = AlignAddressLower(commandLineAddress - argumentVectorSize, 16);
+    stackAddress = argumentVectorAddress - SHADOW_STACK_SIZE - sizeof(PVOID);
+    stackSize = (QWORD)InitialStack - stackAddress;
+    ASSERT(stackSize <= STACK_DEFAULT_SIZE);
+
+    kernelStack = NULL;
+    status = MmuGetSystemVirtualAddressForUserBuffer((PVOID)stackAddress,
+                                                      stackSize,
+                                                      PAGE_RIGHTS_READWRITE,
+                                                      Process,
+                                                      &kernelStack);
+    if (!SUCCEEDED(status))
+    {
+        return status;
+    }
+
+    memzero(kernelStack, stackSize);
+    kernelCommandLine = (char*)PtrOffset(kernelStack, commandLineAddress - stackAddress);
+    pCommandLine = kernelCommandLine;
+    userCommandLine = (char*)commandLineAddress;
+    pArguments = (PVOID*)PtrOffset(kernelStack, argumentVectorAddress - stackAddress);
+    memcpy(pCommandLine, Process->FullCommandLine, commandLineSize);
+
+    argumentIndex = 0;
+    while (*pCommandLine != '\0')
+    {
+        while (*pCommandLine == ' ')
+        {
+            *pCommandLine++ = '\0';
+        }
+
+        if (*pCommandLine == '\0')
+        {
+            break;
+        }
+
+        argumentOffset = (QWORD)(pCommandLine - kernelCommandLine);
+        pArguments[argumentIndex++] = PtrOffset(userCommandLine, argumentOffset);
+
+        while (*pCommandLine != '\0' && *pCommandLine != ' ')
+        {
+            pCommandLine++;
+        }
+    }
+
+    pArguments[argumentIndex] = NULL;
+    *ResultingStack = (PVOID)stackAddress;
+    MmuFreeSystemVirtualAddressForUserBuffer(kernelStack);
 
     return STATUS_SUCCESS;
 }
